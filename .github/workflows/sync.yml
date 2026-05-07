@@ -1,0 +1,133 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '15 18 * * *'  # 02:15 北京 (避开 claude-code-mirror 的 02:00)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Pin a specific upstream tag (e.g. rust-v0.128.0). Empty = latest.'
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target tag/version
+        id: version
+        run: |
+          INPUT="${{ github.event.inputs.tag }}"
+          if [ -n "$INPUT" ]; then
+            TAG="$INPUT"
+          else
+            TAG=$(curl -fsSL --retry 3 \
+              "https://api.github.com/repos/openai/codex/releases/latest" \
+              | jq -r '.tag_name')
+          fi
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "could not resolve upstream tag" >&2
+            exit 1
+          fi
+          VERSION="${TAG#rust-v}"
+          VERSION="${VERSION#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Upstream → $TAG (version=$VERSION)"
+
+      - name: Check if our release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OURTAG="v${{ steps.version.outputs.version }}"
+          if gh release view "$OURTAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release $OURTAG already mirrored, will only update channel pointer"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run sync.sh
+        if: steps.check.outputs.exists == 'false'
+        env:
+          CHANNEL: ${{ steps.version.outputs.tag }}
+          WORK_DIR: ./work
+        run: |
+          chmod +x sync/sync.sh
+          ./sync/sync.sh
+
+      - name: Create release with artifacts
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          UTAG="${{ steps.version.outputs.tag }}"
+          OURTAG="v$V"
+          gh release create "$OURTAG" \
+            --repo "${{ github.repository }}" \
+            --title "$OURTAG" \
+            --notes "Mirror of [openai/codex@$UTAG](https://github.com/openai/codex/releases/tag/$UTAG) on $(date -u '+%Y-%m-%d %H:%M UTC')" \
+            --latest=true \
+            ./work/$V/*
+
+      - name: Update channel pointer
+        run: |
+          mkdir -p channels
+          echo -n "${{ steps.version.outputs.version }}" > channels/latest.txt
+
+      - name: Commit channel pointer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add channels/
+          if git diff --cached --quiet; then
+            echo "channel pointer unchanged"
+            exit 0
+          fi
+          git commit -m "chore: bump latest → ${{ steps.version.outputs.version }}"
+          for i in 1 2 3; do
+            git pull --rebase origin main || true
+            if git push; then
+              exit 0
+            fi
+            echo "push attempt $i failed, retrying..."
+            sleep 5
+          done
+          exit 1
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "Sync failed: $(date -u +%Y-%m-%d)" \
+            --body "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --label "sync-failure" || true
+
+  cleanup-old:
+    runs-on: ubuntu-latest
+    needs: sync
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep most recent N releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: 3
+        run: |
+          TO_DELETE=$(gh release list --repo "${{ github.repository }}" \
+            --exclude-drafts --exclude-pre-releases \
+            --limit 100 --json tagName,createdAt \
+            | jq -r --argjson k "$KEEP" 'sort_by(.createdAt) | reverse | .[$k:][].tagName')
+          for tag in $TO_DELETE; do
+            echo "deleting old release $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag || true
+          done
