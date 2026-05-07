@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 #
-# sync-npm.sh — mirror @openai/codex + platform subpackages as .tgz.
+# sync-npm.sh — mirror @openai/codex npm tarballs.
+#
+# Codex uses a single-package + version-alias trick: all platform binaries are
+# stored as alternate version tags of `@openai/codex` itself, e.g.
+# `0.128.0-linux-x64` instead of as separate `@openai/codex-linux-x64` packages.
+# (Claude Code uses the per-platform-package convention; we have to handle both.)
 #
 # Inputs (env):
-#   VERSION    Required. The npm package version (e.g. "0.128.0").
+#   VERSION    Required. Base version, e.g. "0.128.0".
 #   WORK_DIR   stage dir (default: ./work)
 #
 # Output: $WORK_DIR/$VERSION/npm/
-#   *.tgz                   one tarball per package
+#   *.tgz                   one tarball per (base + 6 platform variants)
 #   npm-manifest.json       version + sha256 of each tarball
 
 set -euo pipefail
@@ -15,41 +20,45 @@ set -euo pipefail
 VERSION="${VERSION:?VERSION required}"
 WORK_DIR="${WORK_DIR:-./work}"
 
-PACKAGES=(
-  "@openai/codex"
-  "@openai/codex-darwin-arm64"
-  "@openai/codex-darwin-x64"
-  "@openai/codex-linux-arm64"
-  "@openai/codex-linux-x64"
-  "@openai/codex-win32-arm64"
-  "@openai/codex-win32-x64"
-)
-
 REGISTRY="https://registry.npmjs.org"
+SCOPE="@openai/codex"
+UNSCOPED="codex"
+
+# Each entry is "<version-suffix> <platform-label>" — empty suffix = main package.
+TARGETS=(
+  ""             # base package
+  "linux-x64"
+  "linux-arm64"
+  "darwin-x64"
+  "darwin-arm64"
+  "win32-x64"
+  "win32-arm64"
+)
 
 OUT="$WORK_DIR/$VERSION/npm"
 mkdir -p "$OUT"
 
 log() { echo "[sync-npm] $*" >&2; }
 
-tarball_url() {
-  local pkg="$1" version="$2"
-  local unscoped="${pkg##*/}"
-  echo "$REGISTRY/$pkg/-/$unscoped-$version.tgz"
-}
-
 PACKAGES_JSON="[]"
 
-for pkg in "${PACKAGES[@]}"; do
-  url=$(tarball_url "$pkg" "$VERSION")
-  unscoped="${pkg##*/}"
-  out_name="${unscoped}-${VERSION}.tgz"
+for suffix in "${TARGETS[@]}"; do
+  if [[ -z "$suffix" ]]; then
+    pkg_version="$VERSION"
+    label="main"
+  else
+    pkg_version="${VERSION}-${suffix}"
+    label="$suffix"
+  fi
+
+  url="$REGISTRY/$SCOPE/-/$UNSCOPED-$pkg_version.tgz"
+  out_name="${UNSCOPED}-${pkg_version}.tgz"
   out_path="$OUT/$out_name"
 
-  log "$pkg @ $VERSION"
+  log "$SCOPE @ $pkg_version  ($label)"
   log "  GET $url"
   if ! curl -fsSL --retry 3 -o "$out_path" "$url"; then
-    log "  ✗ failed (package may not exist on npm at this version)"
+    log "  ✗ failed"
     continue
   fi
 
@@ -58,12 +67,13 @@ for pkg in "${PACKAGES[@]}"; do
   log "  ✓ $size bytes, sha256=$checksum"
 
   PACKAGES_JSON=$(jq \
-    --arg name "$pkg" \
-    --arg version "$VERSION" \
+    --arg name "$SCOPE" \
+    --arg version "$pkg_version" \
+    --arg label "$label" \
     --arg tgz "$out_name" \
     --arg checksum "$checksum" \
     --argjson size "$size" \
-    '. + [{name: $name, version: $version, tgz: $tgz, checksum: $checksum, size: $size}]' \
+    '. + [{name: $name, version: $version, label: $label, tgz: $tgz, checksum: $checksum, size: $size}]' \
     <<<"$PACKAGES_JSON")
 done
 
