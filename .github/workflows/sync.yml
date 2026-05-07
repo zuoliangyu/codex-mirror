@@ -131,3 +131,4 @@ jobs:
             echo "deleting old release $tag"
             gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag || true
           done
+
