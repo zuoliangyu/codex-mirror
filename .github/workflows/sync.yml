@@ -48,12 +48,11 @@ jobs:
           OURTAG="v${{ steps.version.outputs.version }}"
           if gh release view "$OURTAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Release $OURTAG already mirrored, will only update channel pointer"
           else
             echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Run sync.sh
+      - name: Run sync.sh (native binaries)
         if: steps.check.outputs.exists == 'false'
         env:
           CHANNEL: ${{ steps.version.outputs.tag }}
@@ -62,7 +61,16 @@ jobs:
           chmod +x sync/sync.sh
           ./sync/sync.sh
 
-      - name: Create release with artifacts
+      - name: Run sync-npm.sh (npm tarballs)
+        # Always run, so retroactively-added npm files get uploaded with --clobber.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          WORK_DIR: ./work
+        run: |
+          chmod +x sync/sync-npm.sh
+          ./sync/sync-npm.sh
+
+      - name: Create release with all artifacts (new version)
         if: steps.check.outputs.exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -70,12 +78,29 @@ jobs:
           V="${{ steps.version.outputs.version }}"
           UTAG="${{ steps.version.outputs.tag }}"
           OURTAG="v$V"
+          mapfile -t files < <(find ./work/$V -type f)
           gh release create "$OURTAG" \
             --repo "${{ github.repository }}" \
             --title "$OURTAG" \
-            --notes "Mirror of [openai/codex@$UTAG](https://github.com/openai/codex/releases/tag/$UTAG) on $(date -u '+%Y-%m-%d %H:%M UTC')" \
+            --notes "Mirror of [openai/codex@$UTAG](https://github.com/openai/codex/releases/tag/$UTAG) (native + npm) on $(date -u '+%Y-%m-%d %H:%M UTC')" \
             --latest=true \
-            ./work/$V/*
+            "${files[@]}"
+
+      - name: Upload npm tarballs to existing release (retroactive)
+        if: steps.check.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          OURTAG="v$V"
+          npm_dir="./work/$V/npm"
+          if [ -d "$npm_dir" ]; then
+            mapfile -t files < <(find "$npm_dir" -type f)
+            for f in "${files[@]}"; do
+              echo "uploading: $f"
+              gh release upload "$OURTAG" "$f" --repo "${{ github.repository }}" --clobber
+            done
+          fi
 
       - name: Update channel pointer
         run: |
@@ -111,24 +136,3 @@ jobs:
             --title "Sync failed: $(date -u +%Y-%m-%d)" \
             --body "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --label "sync-failure" || true
-
-  cleanup-old:
-    runs-on: ubuntu-latest
-    needs: sync
-    if: always()
-    steps:
-      - uses: actions/checkout@v4
-      - name: Keep most recent N releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-          KEEP: 3
-        run: |
-          TO_DELETE=$(gh release list --repo "${{ github.repository }}" \
-            --exclude-drafts --exclude-pre-releases \
-            --limit 100 --json tagName,createdAt \
-            | jq -r --argjson k "$KEEP" 'sort_by(.createdAt) | reverse | .[$k:][].tagName')
-          for tag in $TO_DELETE; do
-            echo "deleting old release $tag"
-            gh release delete "$tag" --repo "${{ github.repository }}" --yes --cleanup-tag || true
-          done
-
